@@ -414,3 +414,27 @@ def archive_draft(draft_id: int, expected_version: int) -> dict:
                 ),
             )
         return get_draft(draft_id)
+
+
+# ---------------- 电费试算（只读归档冻结曲线） ----------------
+
+
+def get_archived_curve(draft_id: int) -> dict:
+    """读取已归档炉次的冻结曲线用于电费试算。
+
+    - 炉次不存在 => NotFound（404）；
+    - 炉次存在但未归档（活动草稿 / 无解草稿）=> Unprocessable（422）；
+    - 已归档 => 返回冻结版本与冻结温度序列。只读，绝无任何写入。
+    """
+    with lock(), connect() as conn:
+        row = conn.execute(_DRAFT_SELECT + " WHERE d.id=?", (draft_id,)).fetchone()
+        if row is None:
+            raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+        if row["archive_id"] is None:
+            raise Unprocessable("该炉次尚未归档，电费试算只能针对已归档的冻结曲线。")
+        result = json.loads(row["archived_result_json"])
+        return {
+            "id": draft_id,
+            "version": row["archived_draft_version"],
+            "temperatures": list(result["temperatures"]),
+        }

@@ -405,3 +405,72 @@ tr.row-disabled td { color: #8a97a5; background: #fafbfc; }
 @media (max-width: 720px) {
   #recipe-fields.fields { grid-template-columns: 1fr 1fr; }
 }
+
+/* ---------- 归档炉次电费试算 ---------- */
+#draft-electricity-card .badge { vertical-align: middle; }
+.elec-top {
+  display: flex;
+  gap: 16px;
+  margin: 8px 0 12px;
+}
+.elec-start { max-width: 320px; }
+.elec-price-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+.elec-price-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.elec-price-cell span { font-size: 11.5px; color: var(--ink-soft); }
+.elec-price-cell input {
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 13px;
+  width: 100%;
+  min-width: 0;
+  background: #fff;
+}
+.elec-power-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 10px;
+  margin: 4px 0 8px;
+}
+.elec-power-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.elec-power-cell span {
+  font-size: 11.5px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.elec-power-cell input {
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 13px;
+  width: 100%;
+  min-width: 0;
+  background: #fff;
+}
+.elec-price-cell input:focus, .elec-power-cell input:focus, #elec-start:focus {
+  outline: 2px solid rgba(29, 111, 168, 0.35);
+  border-color: var(--brand);
+}
+#elec-totals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 26px;
+  margin: 14px 0;
+  padding: 12px 16px;
+  background: #f1f6fb;
+  border: 1px solid #d8e6f2;
+  border-radius: 8px;
+}
+#elec-totals b { color: var(--brand-dark); font-size: 16px; }
+.elec-round-note { margin: 6px 0 0; font-size: 12.5px; color: var(--warn); }
+@media (max-width: 720px) {
+  .elec-price-grid { grid-template-columns: repeat(4, 1fr); }
+  .elec-power-grid { grid-template-columns: repeat(2, 1fr); }
+}

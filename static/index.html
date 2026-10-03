@@ -177,6 +177,35 @@
         <div id="draft-meta" class="summary"></div>
         <div id="draft-result-slot"></div>
       </section>
+
+      <!-- 电费试算：仅已归档炉次显示；只读冻结曲线，不保存试算、不改动方案 -->
+      <section class="card" id="draft-electricity-card" hidden>
+        <h2>归档炉次电费试算 <span class="badge status-archived">只读 · 不保存</span></h2>
+        <p class="executed-hint">
+          基于本炉次<b>归档冻结</b>的温度曲线逐档试算：每档 5 分钟内功率恒定；
+          电价按 00～23 时给出、每天重复；档位跨小时（含跨午夜）时按落入各小时的
+          分钟数分摊。逐档费用各自四舍五入到分，总费用按<b>未舍入</b>逐档金额
+          汇总后再四舍五入。配方后续修改或停用均不影响本试算。
+        </p>
+        <form id="electricity-form" novalidate>
+          <div class="elec-top">
+            <label class="field elec-start">
+              <span class="field-label">开炉分钟（距当天 00:00，0～1439 整数）</span>
+              <input type="number" id="elec-start" min="0" max="1439" step="1" value="0" />
+            </label>
+          </div>
+          <h3>分时电价（元 / kWh，按 00～23 时，每天重复）</h3>
+          <div id="elec-prices" class="elec-price-grid"></div>
+          <h3>逐档功率（kW，与冻结曲线等长）</h3>
+          <div id="elec-powers" class="elec-power-grid"></div>
+          <p class="form-error" id="elec-error" hidden></p>
+          <div class="actions">
+            <button type="submit" id="elec-submit-btn">试算电费</button>
+            <span class="hint">试算结果不保存，也不会改动归档方案。</span>
+          </div>
+        </form>
+        <div id="elec-result"></div>
+      </section>
     </section>
   </main>
 

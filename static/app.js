@@ -988,6 +988,8 @@ async function openDraft(id, banner) {
 
   const card = draftDetailCard;
   card.hidden = false;
+  // 切换炉次 / 刷新详情：立即清除旧试算（含旧在途响应的回填资格）
+  hideTrial();
   const titleEl = document.getElementById("draft-detail-title");
   titleEl.textContent = `炉次 #${id} 详情加载中…`;
   draftMeta.innerHTML = "";
@@ -1082,6 +1084,11 @@ function renderDraftDetail(d, banner) {
   } else {
     draftResultView.render({ solvable: false, reason: d.reason });
   }
+
+  // 只有已归档（必有冻结曲线）才开放电费试算；试算只读归档，不影响方案
+  if (d.status === "archived") setupTrial(d);
+  else hideTrial();
+
   loadDrafts();
 }
 
@@ -1169,6 +1176,237 @@ draftArchiveBtn.addEventListener("click", async () => {
     kind: "ok",
     text: `归档成功：已冻结炉次 #${r.data.id} 的版本 v${r.data.version} 材料参数与完整求解结果；此后配方修改不再影响本炉次。`,
   });
+});
+
+// ============================================================
+// 已归档炉次电费试算（只读冻结曲线；切换炉次 / 刷新 / 编辑输入立即作废旧试算）
+// ============================================================
+const elecCard = document.getElementById("draft-electricity-card");
+const elecForm = document.getElementById("electricity-form");
+const elecStart = document.getElementById("elec-start");
+const elecPricesBox = document.getElementById("elec-prices");
+const elecPowersBox = document.getElementById("elec-powers");
+const elecError = document.getElementById("elec-error");
+const elecResult = document.getElementById("elec-result");
+const elecSubmitBtn = document.getElementById("elec-submit-btn");
+
+// trialSeq：试算代际。切换炉次、刷新详情、重建功率表、编辑任一输入都会 +1；
+// 只有最新一代的成功响应 / 失败响应 / 网络异常允许回填，迟到回包一律丢弃。
+let trialSeq = 0;
+let trialInflight = 0; // 在途试算请求数（用于正确恢复按钮，避免旧回包解锁新请求）
+let elecDraft = null; // 当前试算所绑定的已归档炉次
+
+// 24 小时电价输入（00～23 时）只需建一次；数值作为试算输入保留
+for (let h = 0; h < 24; h++) {
+  const cell = el("label", { class: "elec-price-cell" },
+    el("span", { textContent: `${String(h).padStart(2, "0")} 时` }),
+    el("input", {
+      type: "number", min: "0", step: "any", defaultValue: "0.5",
+      attrs: { "data-elec": "price", "data-hour": String(h), inputmode: "decimal" },
+    }));
+  cell.querySelector("input").value = "0.5";
+  elecPricesBox.appendChild(cell);
+}
+
+function clearTrialOutput() {
+  // 只清结果区（用于编辑输入时立即移除旧试算数字）；错误提示交给提交逻辑管理
+  elecResult.innerHTML = "";
+}
+
+function invalidateTrial() {
+  // 旧试算立即作废：代际 +1、清空结果与错误（输入框本身保留供继续编辑）
+  trialSeq += 1;
+  clearTrialOutput();
+  elecError.hidden = true;
+}
+
+function rebuildPowerInputs(temperatures) {
+  elecPowersBox.innerHTML = "";
+  temperatures.forEach((t, i) => {
+    const cell = el("label", { class: "elec-power-cell" },
+      el("span", { textContent: `第 ${i + 1} 档 · ${t}°C` }),
+      el("input", {
+        type: "number", min: "0", step: "any",
+        attrs: { "data-elec": "power", "data-step": String(i + 1), inputmode: "decimal",
+                 placeholder: "0" },
+      }));
+    elecPowersBox.appendChild(cell);
+  });
+}
+
+function setupTrial(d) {
+  // 仅已归档炉次可试算；曲线来自归档冻结结果，与配方当前状态无关
+  invalidateTrial();
+  elecDraft = d;
+  rebuildPowerInputs(d.result.temperatures);
+  elecCard.hidden = false;
+}
+
+function hideTrial() {
+  invalidateTrial();
+  elecDraft = null;
+  elecCard.hidden = true;
+}
+
+// 编辑任一试算输入（开炉分钟 / 电价 / 功率）：立即清除旧试算结果，
+// 此前已发请求的迟到响应（含异常）因代际已新而作废
+elecForm.addEventListener("input", () => {
+  trialSeq += 1;
+  clearTrialOutput();
+});
+
+function fmtNum(x) {
+  // 页面展示：去掉浮点噪声，最多 4 位小数（费用列固定 2 位）
+  return String(Math.round(Number(x) * 10000) / 10000);
+}
+function fmtMoney(x) {
+  return Number(x).toFixed(2);
+}
+
+function readElecPrices() {
+  const out = new Array(24);
+  const inputs = elecPricesBox.querySelectorAll('input[data-elec="price"]');
+  for (const inp of inputs) {
+    const h = Number(inp.dataset.hour);
+    const raw = inp.value.trim();
+    if (raw === "") { out[h] = 0; continue; } // 留空按 0 元/kWh
+    const v = Number(raw);
+    if (!Number.isFinite(v) || v < 0) {
+      return { error: `${String(h).padStart(2, "0")} 时电价必须是非负有限数值。` };
+    }
+    out[h] = v;
+  }
+  return { values: out };
+}
+
+function readElecPowers(n) {
+  const out = [];
+  const inputs = elecPowersBox.querySelectorAll('input[data-elec="power"]');
+  for (const inp of inputs) {
+    const raw = inp.value.trim();
+    if (raw === "") { out.push(0); continue; } // 留空按 0 kW
+    const v = Number(raw);
+    if (!Number.isFinite(v) || v < 0) {
+      return { error: `第 ${inp.dataset.step} 档功率必须是非负有限数值。` };
+    }
+    out.push(v);
+  }
+  if (out.length !== n) {
+    return { error: `功率档位数量（${out.length}）与冻结曲线档数（${n}）不一致。` };
+  }
+  return { values: out };
+}
+
+function renderElectricity(data) {
+  elecResult.innerHTML = "";
+  const totals = el("div", { id: "elec-totals" });
+  totals.appendChild(el("div", { class: "kv" },
+    document.createTextNode("总电量："),
+    el("b", { textContent: `${fmtNum(data.totalKwh)} kWh` })));
+  totals.appendChild(el("div", { class: "kv" },
+    document.createTextNode("总费用（未舍入逐档汇总后四舍五入）："),
+    el("b", { textContent: `${fmtMoney(data.totalCost)} 元` })));
+  totals.appendChild(el("div", { class: "kv" },
+    document.createTextNode("总时长："),
+    el("b", { textContent: `${data.totalMinutes} 分钟（${data.stepCount} 档）` })));
+  elecResult.appendChild(totals);
+
+  const card = el("section", { class: "card" },
+    el("h2", { textContent: "逐档电费明细" }));
+  const tableWrap = el("div", { class: "table-wrap" });
+  const table = el("table");
+  table.appendChild(el("thead", {}, el("tr", {},
+    el("th", { textContent: "档位" }),
+    el("th", { textContent: "设定温度 (°C)" }),
+    el("th", { textContent: "时长 (分钟)" }),
+    el("th", { textContent: "电量 (kWh)" }),
+    el("th", { textContent: "费用 (元)" }))));
+  const tbody = el("tbody");
+  let roundedSum = 0;
+  data.steps.forEach((s) => {
+    roundedSum += s.cost;
+    const tr = el("tr");
+    tr.appendChild(el("td", { textContent: String(s.index) }));
+    tr.appendChild(el("td", { textContent: String(s.temperature) }));
+    tr.appendChild(el("td", { textContent: String(s.minutes) }));
+    tr.appendChild(el("td", { textContent: fmtNum(s.kwh) }));
+    tr.appendChild(el("td", { textContent: fmtMoney(s.cost) }));
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  tableWrap.appendChild(table);
+  card.appendChild(tableWrap);
+  elecResult.appendChild(card);
+
+  // 逐档费用先各自舍入，其和与总费用可能相差 1 分
+  if (Math.abs(roundedSum - data.totalCost) > 1e-9) {
+    elecResult.appendChild(el("p", { class: "elec-round-note", textContent:
+      `注：逐档费用已各自四舍五入到分（合计 ${fmtMoney(roundedSum)} 元），` +
+      `总费用按未舍入逐档金额汇总后再四舍五入，因此为 ${fmtMoney(data.totalCost)} 元。` }));
+  }
+}
+
+elecForm.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  if (!elecDraft || elecDraft.status !== "archived") return;
+  clearTrialOutput();
+  elecError.hidden = true;
+
+  // 先做客户端校验：此时不占用代际 / 在途计数，旧请求的回包处理不受影响
+  const startRaw = elecStart.value.trim();
+  if (!/^\d+$/.test(startRaw)) {
+    elecError.textContent = "开炉分钟必须是 0～1439 之间的整数。";
+    elecError.hidden = false;
+    return;
+  }
+  const startMinute = Number(startRaw);
+  if (startMinute < 0 || startMinute > 1439) {
+    elecError.textContent = "开炉分钟必须在 0～1439 之间。";
+    elecError.hidden = false;
+    return;
+  }
+  const n = elecDraft.result.temperatures.length;
+  const { values: prices, error: pErr } = readElecPrices();
+  if (pErr) { elecError.textContent = pErr; elecError.hidden = false; return; }
+  const { values: powers, error: wErr } = readElecPowers(n);
+  if (wErr) { elecError.textContent = wErr; elecError.hidden = false; return; }
+
+  // 正式发起请求才登记新一代：旧结果即刻作废，旧回包到达时按代际丢弃
+  const seq = ++trialSeq;
+  trialInflight += 1;
+  elecSubmitBtn.disabled = true;
+  elecSubmitBtn.textContent = "试算中…";
+  let r;
+  try {
+    r = await api(`/api/drafts/${elecDraft.id}/electricity`, {
+      method: "POST",
+      body: JSON.stringify({ startMinute, prices, powers }),
+    });
+  } catch (e) {
+    trialInflight = Math.max(0, trialInflight - 1);
+    // 网络异常同样只认最新一代：不得回填已被切换 / 编辑作废的试算区
+    if (seq === trialSeq) {
+      elecError.textContent = "试算请求失败（网络异常），未改变任何数据，可重试。";
+      elecError.hidden = false;
+      if (trialInflight === 0) {
+        elecSubmitBtn.disabled = false;
+        elecSubmitBtn.textContent = "试算电费";
+      }
+    }
+    return;
+  }
+  trialInflight = Math.max(0, trialInflight - 1);
+  // 迟到响应（切换炉次 / 刷新 / 新试算 / 编辑输入之后到达）一律作废，
+  // 也绝不恢复按钮（按钮只由当前最新一代的在途状态决定）
+  if (seq !== trialSeq) return;
+  elecSubmitBtn.disabled = false;
+  elecSubmitBtn.textContent = "试算电费";
+  if (!r.ok) {
+    elecError.textContent = detailOf(r.data);
+    elecError.hidden = false;
+    return;
+  }
+  renderElectricity(r.data);
 });
 
 // ---------- 启动 ----------

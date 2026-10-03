@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import store
+from . import electricity, store
 from .db import init_db
 from .solver import Material, solve
 from .solver import validate_material as solver_validate_material
@@ -27,7 +29,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="共炉保温编排台", version="2.1.0", lifespan=lifespan)
+app = FastAPI(title="共炉保温编排台", version="2.2.0", lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -315,6 +317,136 @@ def archive_draft(draft_id: int, payload: ArchiveIn):
         return store.archive_draft(draft_id, payload.version)
     except store.StoreError as exc:
         _raise_store_error(exc)
+
+
+# ---------------- 已归档炉次电费试算（只读，不保存） ----------------
+
+
+def _nonneg_number(raw: Any, label: str) -> float:
+    """校验单个「非负有限数」；布尔与非数值一律拒绝。"""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(f"{label}必须是非负数值。")
+    value = float(raw)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{label}必须是非负有限数。")
+    return value
+
+
+_ELECTRICITY_BODY_SCHEMA = {
+    "type": "object",
+    "required": ["startMinute", "prices", "powers"],
+    "properties": {
+        "startMinute": {
+            "title": "开炉分钟",
+            "description": "首档开始时刻距当天 00:00 的分钟数（0～1439 整数）",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1439,
+        },
+        "prices": {
+            "title": "分时电价",
+            "description": "按 00～23 时排列的 24 个电价（元/kWh），非负有限数",
+            "type": "array",
+            "items": {"type": "number", "minimum": 0},
+            "minItems": 24,
+            "maxItems": 24,
+        },
+        "powers": {
+            "title": "逐档功率",
+            "description": "与归档冻结曲线等长的逐档功率（kW），非负有限数",
+            "type": "array",
+            "items": {"type": "number", "minimum": 0},
+            "minItems": 1,
+        },
+    },
+}
+
+
+def _validate_electricity_body(body: Any) -> tuple[int, list[float], list[float]]:
+    """校验试算输入；非法时抛 422（中文 detail）。"""
+
+    def fail(text: str) -> None:
+        raise HTTPException(status_code=422, detail=text)
+
+    if not isinstance(body, dict):
+        fail("请求体必须是 JSON 对象。")
+
+    if "startMinute" not in body:
+        fail("缺少必填字段 startMinute（开炉分钟）。")
+    if "prices" not in body:
+        fail("缺少必填字段 prices（24 个分时电价）。")
+    if "powers" not in body:
+        fail("缺少必填字段 powers（逐档功率）。")
+
+    raw_start = body["startMinute"]
+    # 只接受真正的整数；拒绝布尔与 12.0 这类小数
+    if isinstance(raw_start, bool) or not isinstance(raw_start, int):
+        fail("开炉分钟必须是 0～1439 之间的整数。")
+    if not 0 <= raw_start <= 1439:
+        fail("开炉分钟必须在 0～1439 之间。")
+
+    raw_prices = body["prices"]
+    if not isinstance(raw_prices, list):
+        fail("电价必须是以数组形式给出的 24 个数值。")
+    if len(raw_prices) != 24:
+        fail("电价必须恰好为 24 个（按 00～23 时排列）。")
+    try:
+        prices = [_nonneg_number(v, "电价") for v in raw_prices]
+    except ValueError as exc:
+        fail(str(exc))
+
+    raw_powers = body["powers"]
+    if not isinstance(raw_powers, list):
+        fail("功率必须是以数组形式给出的逐档数值。")
+    if not raw_powers:
+        fail("功率数组不能为空，且必须与归档冻结曲线等长。")
+    try:
+        powers = [_nonneg_number(v, "功率") for v in raw_powers]
+    except ValueError as exc:
+        fail(str(exc))
+
+    return raw_start, prices, powers
+
+
+@app.post(
+    "/api/drafts/{draft_id}/electricity",
+    response_model=None,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": _ELECTRICITY_BODY_SCHEMA}},
+        }
+    },
+)
+async def draft_electricity(draft_id: int, request: Request):
+    # 第一步只判定炉次：未知炉次一律 404，哪怕请求体字段缺失 / 类型错误；
+    # 存在但未归档（活动 / 无解草稿）一律 422。二者均为只读操作。
+    try:
+        curve = store.get_archived_curve(draft_id)
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+    # 炉次已确认存在且已归档，再解析并校验请求体（保持 404 优先于 422）
+    try:
+        raw = await request.body()
+        body = json.loads(raw.decode("utf-8") or "null")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="请求体不是合法的 JSON。") from exc
+
+    start_minute, prices, powers = _validate_electricity_body(body)
+
+    temperatures = curve["temperatures"]
+    if len(powers) != len(temperatures):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"功率数组长度（{len(powers)}）必须与归档冻结曲线档数"
+                f"（{len(temperatures)}）一致。"
+            ),
+        )
+
+    result = electricity.estimate(temperatures, start_minute, prices, powers)
+    return {"draftId": draft_id, "version": curve["version"], **result}
 
 
 @app.get("/healthz")
