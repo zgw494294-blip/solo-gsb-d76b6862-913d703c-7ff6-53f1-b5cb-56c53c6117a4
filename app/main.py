@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from . import store
+from . import tariff as tariff_calc
 from .db import init_db
 from .solver import Material, solve
 from .solver import validate_material as solver_validate_material
@@ -27,7 +28,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="共炉保温编排台", version="2.1.0", lifespan=lifespan)
+app = FastAPI(title="共炉保温编排台", version="2.2.0", lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -315,6 +316,43 @@ def archive_draft(draft_id: int, payload: ArchiveIn):
         return store.archive_draft(draft_id, payload.version)
     except store.StoreError as exc:
         _raise_store_error(exc)
+
+
+# ---------------- 已归档炉次电费试算 ----------------
+
+
+class TariffTrialIn(BaseModel):
+    """电费试算入参：开炉分钟 + 24 小时电价 + 与冻结曲线等长的逐档功率。
+
+    逐档功率档数取决于归档曲线，故长度一致性在路由里读取归档后再校验。
+    试算为纯读操作：不保存试算，也不改动任何配方 / 炉次 / 归档数据。
+    """
+
+    start_minute: Any = Field(alias="startMinute")
+    prices: Any
+    powers: Any
+
+    model_config = {"populate_by_name": True}
+
+
+@app.post("/api/drafts/{draft_id}/tariff-trial")
+def tariff_trial(draft_id: int, payload: TariffTrialIn):
+    # 先判定炉次存在性与归档状态：未知 404，未归档 422；只读取冻结快照
+    try:
+        draft = store.get_archived_draft(draft_id)
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+    temperatures = draft["result"]["temperatures"]
+    try:
+        start_minute, prices, powers = tariff_calc.validate_trial_inputs(
+            payload.start_minute, payload.prices, payload.powers, len(temperatures)
+        )
+        result = tariff_calc.simulate(temperatures, start_minute, prices, powers)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return {"draftId": draft_id, **result}
 
 
 @app.get("/healthz")

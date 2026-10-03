@@ -371,6 +371,23 @@ def create_draft(name: str, recipe_ids: list[int]) -> dict:
         return get_draft(draft_id)
 
 
+def get_archived_draft(draft_id: int) -> dict:
+    """仅读取已归档炉次（冻结快照），供电费试算使用。
+
+    不存在 => NotFound（路由层 404）；存在但未归档 => Unprocessable
+    （路由层 422）。只读，不写任何数据，配方后续修改 / 停用均不影响结果。
+    """
+    with lock(), connect() as conn:
+        row = conn.execute(
+            _DRAFT_SELECT + " WHERE d.id=?", (draft_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"炉次 {draft_id} 不存在。")
+        if row["archive_id"] is None:
+            raise Unprocessable(f"炉次 {draft_id} 尚未归档，不能试算电费。")
+        return _draft_dict(row)
+
+
 def archive_draft(draft_id: int, expected_version: int) -> dict:
     """归档核准的炉次方案。
 

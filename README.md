@@ -8,6 +8,10 @@
 逐档核验合法后，以最后已执行温度接续，在 20 档总上限内编排最短且回到
 20°C 的后续曲线；首个违规档即拒绝续排。
 
+已归档炉次还支持**电费试算**：给定开炉分钟、24 个分时电价与逐档功率，
+按归档时**冻结的曲线**逐档计算 kWh 与电费（跨小时 / 跨午夜按分钟分摊），
+试算只读不保存，配方之后的修改或停用均不影响结果。
+
 - 后端：Python + FastAPI（求解核心见 `app/solver.py`，纯标准库 BFS；
   配方 / 炉次 / 归档用 SQLite 持久化，见 `app/db.py`、`app/store.py`）
 - 前端：原生 HTML / CSS / JavaScript（`static/`，无任何前端构建与框架，
@@ -227,6 +231,7 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 | POST | `/api/drafts` | 按 2～3 个不同现有配方 ID 创建炉次并从空记录求解（201；引用已停用配方 422） |
 | GET | `/api/drafts/{id}` | 读取炉次详情（归档后返回冻结快照） |
 | POST | `/api/drafts/{id}/archive` | 携带查看版本归档（过期 409 / 无解 422） |
+| POST | `/api/drafts/{id}/tariff-trial` | 已归档炉次按冻结曲线试算电费（未知 404 / 未归档或参数非法 422；只读不保存） |
 
 ### 从零编排（可直接复制执行）
 
@@ -496,14 +501,130 @@ curl -sS -X POST http://localhost:8000/api/drafts/1/archive \
 归档成功后再次 `PUT /api/recipes/1` 只影响其他**未归档**炉次；
 `GET /api/drafts/1` 永远返回归档时冻结的版本、参数与结果。
 
+### 已归档炉次电费试算 `POST /api/drafts/{id}/tariff-trial`
+
+只对**已归档**炉次开放，且只读取归档时**冻结的曲线**：之后配方被修改或
+停用、草稿版本如何变化，试算使用的温度序列都不变。**试算不保存、不改动
+任何方案**。请求体：
+
+- `startMinute`：开炉分钟，从当天 00:00 起算的 **0～1439 整数**；
+- `prices`：按 **00～23 时**排列的 **24 个**电价（元/kWh），非负有限数，
+  电价**每天重复**（跨午夜的档位取次日 00 时起的电价）；
+- `powers`：与**冻结曲线等长**的逐档功率（kW），非负有限数，每档功率在
+  其 **5 分钟**内恒定。
+
+计算规则：每档 `kWh = 功率 × 5/60`；档位跨小时（含跨午夜）时，按落入各
+小时的分钟数分摊电费。**逐档金额各自四舍五入到两位**（元）；**总费用先
+汇总未舍入的逐档金额，再四舍五入到两位**，因此逐档金额之和可能与总费用
+相差 1 分；`kWh` 不做业务舍入。状态码：未知炉次 **404**；炉次存在但**未
+归档**或任一参数非法 **422**（中文 `detail`）。
+
+沿用上文归档好的炉次 #1（冻结曲线 `[40,60,80,60,40,20]`，共 6 档）。
+
+```bash
+# 08:00 开炉（480 分钟），全天电价 0.6 元/kWh；功率 60/120/0/60/60/120 kW
+curl -sS -X POST http://localhost:8000/api/drafts/1/tariff-trial \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "startMinute": 480,
+    "prices": [0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,
+               0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6],
+    "powers": [60,120,0,60,60,120]
+  }'
+```
+
+返回（HTTP 200）：
+
+```json
+{
+  "draftId": 1,
+  "startMinute": 480,
+  "stepCount": 6,
+  "steps": [
+    {"index": 1, "temperature": 40, "minutes": 5, "startMinute": 480, "kwh": 5.0,  "cost": 3.0},
+    {"index": 2, "temperature": 60, "minutes": 5, "startMinute": 485, "kwh": 10.0, "cost": 6.0},
+    {"index": 3, "temperature": 80, "minutes": 5, "startMinute": 490, "kwh": 0.0,  "cost": 0.0},
+    {"index": 4, "temperature": 60, "minutes": 5, "startMinute": 495, "kwh": 5.0,  "cost": 3.0},
+    {"index": 5, "temperature": 40, "minutes": 5, "startMinute": 500, "kwh": 5.0,  "cost": 3.0},
+    {"index": 6, "temperature": 20, "minutes": 5, "startMinute": 505, "kwh": 10.0, "cost": 6.0}
+  ],
+  "totalKwh": 35.0,
+  "totalCost": 21.0
+}
+```
+
+跨小时分摊示例（07:58 开炉，07 时电价 0.4、08 时 1.2，其余 0.4；首档
+60 kW 落在 07:58～08:00 的 2 分钟按 0.4、落在 08:00～08:03 的 3 分钟按
+1.2 计费，电费 = 60×2/60×0.4 + 60×3/60×1.2 = 0.8 + 3.6 = 4.4 元）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/drafts/1/tariff-trial \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "startMinute": 478,
+    "prices": [0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,1.2,0.4,0.4,0.4,
+               0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4],
+    "powers": [60,120,0,60,60,120]
+  }'
+# 节选：steps[0] = {"index":1,"startMinute":478,"kwh":5.0,"cost":4.4,...}
+#       "totalKwh": 35.0, "totalCost": 40.4
+```
+
+跨午夜示例（23:58 = 1438 分钟开炉，23 时电价 0.8、00 时起 0.3，6 档全为
+120 kW；首档 23:58～00:03 按 2 分钟 0.8 + 3 分钟 0.3 分摊，次日各档的
+`startMinute` 对 1440 取模）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/drafts/1/tariff-trial \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "startMinute": 1438,
+    "prices": [0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,
+               0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.8],
+    "powers": [120,120,120,120,120,120]
+  }'
+# 节选：各档 startMinute = [1438,3,8,13,18,23]；首档 cost 5.0，
+#       其余各档 3.0；"totalKwh": 60.0, "totalCost": 20.0
+```
+
+逐档金额四舍五入、总费用汇总未舍入值的示例（各档 1 kW、电价 0.3：单档
+电费 0.025 元，逐档显示 `0.03`，6 档合计按未舍入值汇总为 6×0.025 = `0.15`，
+而不是 6×0.03 = 0.18）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/drafts/1/tariff-trial \
+  -H 'Content-Type: application/json' \
+  -d '{"startMinute":0,"prices":[0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3],"powers":[1,1,1,1,1,1]}'
+# 各档 "cost": 0.03；"totalCost": 0.15
+```
+
+错误情况：
+
+```bash
+# 未归档炉次
+curl -sS -X POST http://localhost:8000/api/drafts/2/tariff-trial \
+  -H 'Content-Type: application/json' \
+  -d '{"startMinute":0,"prices":[0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3,0.3],"powers":[1,1,1,1,1,1]}'
+# 422：{"detail":"炉次 2 尚未归档，不能试算电费。"}
+# 未知炉次 -> 404：{"detail":"炉次 99 不存在。"}
+# 功率档数不符 -> 422：{"detail":"功率档数必须与冻结曲线等长（6 档），当前为 5 档。"}
+# 电价数量不符 -> 422：{"detail":"电价必须恰好为 24 个（按 00～23 时排列），当前为 23 个。"}
+# 开炉分钟越界 -> 422：{"detail":"开炉分钟必须是 0～1439 的整数。"}
+```
+
+前端「炉次草稿」详情对已归档炉次提供试算卡片：**切换炉次、刷新详情或
+编辑任一试算输入时旧试算立即清除**；此前请求的迟到响应（成功 / 404 /
+422 / 网络异常）按请求代际一律作废，不会回填到当前视图。
+
 ## 目录结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive）
+│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive / 电费试算）
 │   ├── solver.py      # 规则常量、校验与 BFS 求解（配方与草稿复用）
+│   ├── tariff.py      # 已归档冻结曲线的电费试算纯计算（Decimal，跨小时 / 跨午夜分摊）
 │   ├── db.py          # SQLite 连接、建表与全局串行锁
 │   └── store.py       # 配方 / 炉次草稿 / 归档的事务化读写
 ├── static/

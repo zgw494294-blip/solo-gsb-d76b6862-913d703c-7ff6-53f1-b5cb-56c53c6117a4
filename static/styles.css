@@ -405,3 +405,87 @@ tr.row-disabled td { color: #8a97a5; background: #fafbfc; }
 @media (max-width: 720px) {
   #recipe-fields.fields { grid-template-columns: 1fr 1fr; }
 }
+
+/* ---------- 已归档炉次 · 电费试算 ---------- */
+#draft-tariff-card {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px dashed var(--line);
+}
+#draft-tariff-card h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+  color: var(--ink);
+}
+.tariff-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin: 10px 0 4px;
+}
+.tariff-time {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.tariff-time select {
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 14px;
+  background: #fff;
+}
+.tariff-prices-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 12px 0 6px;
+}
+.tariff-price-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 8px;
+}
+.tariff-power-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 8px;
+}
+.tariff-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.tariff-cell-label {
+  font-size: 11.5px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tariff-cell input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 13px;
+  background: #fff;
+}
+.tariff-cell input:focus {
+  outline: 2px solid rgba(29, 111, 168, 0.35);
+  border-color: var(--brand);
+}
+.tariff-result { margin-top: 14px; }
+.tariff-note {
+  margin: 0 0 10px;
+  font-size: 12.5px;
+  color: var(--warn);
+}
+.tariff-time-cell { white-space: nowrap; font-variant-numeric: tabular-nums; }
+tfoot td { font-weight: 600; background: #f1f5f9; }
+@media (max-width: 720px) {
+  .tariff-price-grid { grid-template-columns: repeat(4, 1fr); }
+}

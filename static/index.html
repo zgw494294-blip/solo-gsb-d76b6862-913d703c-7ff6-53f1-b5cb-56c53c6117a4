@@ -176,6 +176,51 @@
         <p class="form-ok" id="draft-detail-ok" hidden></p>
         <div id="draft-meta" class="summary"></div>
         <div id="draft-result-slot"></div>
+
+        <!-- 已归档炉次：基于冻结曲线的电费试算（不保存、不影响任何方案） -->
+        <div id="draft-tariff-card" hidden>
+          <h3>电费试算（基于归档冻结曲线）</h3>
+          <p class="executed-hint">
+            输入开炉时刻、按 00～23 时排列的 24 个电价（元/kWh，每天重复）
+            以及与冻结曲线等长的逐档功率（kW）。每档功率在其 5 分钟内恒定；
+            跨小时、跨午夜的档位按落入各小时的分钟数分摊电费。
+            <b>试算只读取冻结曲线，不保存、不改变任何配方或炉次方案。</b>
+          </p>
+          <form id="draft-tariff-form" novalidate>
+            <div class="tariff-row">
+              <label class="field">
+                <span class="field-label">开炉时刻（当天 00:00 起）</span>
+                <span class="tariff-time">
+                  <select id="tariff-start-hour"></select>
+                  <b>:</b>
+                  <select id="tariff-start-minute"></select>
+                </span>
+              </label>
+              <span class="hint">分钟数按 0～1439 提交；档位可跨入次日，电价按天重复。</span>
+            </div>
+
+            <div class="tariff-prices-head">
+              <span class="field-label">分时电价（元/kWh，00 时 → 23 时）</span>
+              <button class="btn-secondary btn-small" id="tariff-price-fill"
+                      type="button">统一填入</button>
+            </div>
+            <div class="tariff-price-grid" id="tariff-prices"></div>
+
+            <div class="tariff-prices-head">
+              <span class="field-label">逐档功率（kW，按档位顺序）</span>
+              <button class="btn-secondary btn-small" id="tariff-power-fill"
+                      type="button">统一填入</button>
+            </div>
+            <div class="tariff-power-grid" id="tariff-powers"></div>
+
+            <p class="form-error" id="tariff-error" hidden></p>
+            <div class="actions">
+              <button type="submit" id="tariff-submit-btn">试算电费</button>
+              <span class="hint">切换炉次、刷新详情或修改任一试算输入时，旧试算立即清除；迟到响应不会回填。</span>
+            </div>
+          </form>
+          <div id="tariff-result-slot"></div>
+        </div>
       </section>
     </section>
   </main>

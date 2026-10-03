@@ -992,6 +992,8 @@ async function openDraft(id, banner) {
   titleEl.textContent = `炉次 #${id} 详情加载中…`;
   draftMeta.innerHTML = "";
   draftResultView.clear();
+  // 一切换 / 刷新：电费试算面板立即收起，旧试算（含在途响应）即刻作废
+  resetTariffPanel();
   if (banner && banner.kind === "error") {
     draftDetailError.textContent = banner.text;
     draftDetailError.hidden = false;
@@ -1082,6 +1084,14 @@ function renderDraftDetail(d, banner) {
   } else {
     draftResultView.render({ solvable: false, reason: d.reason });
   }
+
+  // 电费试算仅对已归档炉次开放，且始终只针对归档时冻结的曲线
+  if (d.status === "archived") {
+    prepareTariffPanel(d.result.temperatures);
+  } else {
+    resetTariffPanel();
+  }
+
   loadDrafts();
 }
 
@@ -1169,6 +1179,281 @@ draftArchiveBtn.addEventListener("click", async () => {
     kind: "ok",
     text: `归档成功：已冻结炉次 #${r.data.id} 的版本 v${r.data.version} 材料参数与完整求解结果；此后配方修改不再影响本炉次。`,
   });
+});
+
+// ============================================================
+// 已归档炉次 · 电费试算（只读冻结曲线；不保存、不改任何方案）
+// ============================================================
+//
+// 请求编排与详情查看同样严格：
+// - 切换炉次 / 刷新详情：面板收起、旧试算立即清除并作废旧在途响应；
+// - 编辑任一试算输入（开炉时刻 / 电价 / 功率）：立即清除旧试算；
+// - 每笔试算绑定独立代际，迟到响应（成功 / 404 / 422 / 网络异常）
+//   只要不是最新一代，一律不得回填。
+
+const tariffCard = document.getElementById("draft-tariff-card");
+const tariffForm = document.getElementById("draft-tariff-form");
+const tariffHourSel = document.getElementById("tariff-start-hour");
+const tariffMinuteSel = document.getElementById("tariff-start-minute");
+const tariffPricesBox = document.getElementById("tariff-prices");
+const tariffPowersBox = document.getElementById("tariff-powers");
+const tariffError = document.getElementById("tariff-error");
+const tariffSubmitBtn = document.getElementById("tariff-submit-btn");
+const tariffResultSlot = document.getElementById("tariff-result-slot");
+
+let tariffSeq = 0;           // 试算输入 / 请求的代际
+let tariffDraftId = null;    // 当前面板所对应的已归档炉次 ID
+let tariffTemperatures = []; // 当前冻结曲线温度（决定功率档数）
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function hhmm(dayMinute, dayOffset) {
+  const h = Math.floor(dayMinute / 60) % 24;
+  const m = dayMinute % 60;
+  return `${pad2(h)}:${pad2(m)}${dayOffset ? "（次日）" : ""}`;
+}
+
+function fmtKwh(v) {
+  // 数值本身不参与逐档舍入；界面固定 4 位小数展示
+  return (Math.round(v * 10000) / 10000).toFixed(4);
+}
+
+function fmtYuan(v) {
+  return "¥" + Number(v).toFixed(2);
+}
+
+function resetTariffPanel() {
+  // 面板收起、结果与错误清空；代际 +1 使任何旧在途响应作废
+  tariffSeq += 1;
+  tariffDraftId = null;
+  tariffTemperatures = [];
+  tariffCard.hidden = true;
+  tariffResultSlot.innerHTML = "";
+  tariffError.hidden = true;
+  tariffSubmitBtn.disabled = false;
+  tariffSubmitBtn.textContent = "试算电费";
+}
+
+function buildNumberCell(label, value, cls) {
+  return el("label", { class: "tariff-cell" },
+    el("span", { class: "tariff-cell-label", textContent: label }),
+    el("input", {
+      class: cls, type: "text", inputMode: "decimal", autocomplete: "off",
+      value: String(value), placeholder: "0", attrs: { "data-tariff-input": "1" },
+    }));
+}
+
+function prepareTariffPanel(temperatures) {
+  // 每次呈现归档详情都视为新一代（openDraft 已先 reset 过，这里再保险一次）
+  tariffSeq += 1;
+  tariffDraftId = viewedDraft.id;
+  tariffTemperatures = temperatures.slice();
+  tariffResultSlot.innerHTML = "";
+  tariffError.hidden = true;
+  tariffSubmitBtn.disabled = false;
+  tariffSubmitBtn.textContent = "试算电费";
+
+  tariffPowersBox.innerHTML = "";
+  temperatures.forEach((t, i) => {
+    tariffPowersBox.appendChild(buildNumberCell(`第 ${i + 1} 档 · ${t}°C`, 0, "js-tariff-power"));
+  });
+
+  tariffCard.hidden = false;
+}
+
+// 开炉时刻下拉：小时 00～23、分钟按 5 分钟步进（请求接受任意 0～1439 整数）
+if (!tariffHourSel.options.length) {
+  for (let h = 0; h < 24; h++) {
+    tariffHourSel.appendChild(el("option", { value: String(h), textContent: pad2(h) }));
+  }
+  for (let m = 0; m < 60; m += 5) {
+    tariffMinuteSel.appendChild(el("option", { value: String(m), textContent: pad2(m) }));
+  }
+  tariffHourSel.value = "8";
+  tariffMinuteSel.value = "0";
+}
+
+// 24 个电价输入（仅构建一次，切换炉次时保留用户正在比较的电价方案）
+if (!tariffPricesBox.children.length) {
+  for (let h = 0; h < 24; h++) {
+    tariffPricesBox.appendChild(buildNumberCell(`${pad2(h)} 时`, 0.6, "js-tariff-price"));
+  }
+}
+
+function clearTariffResult() {
+  // 编辑任一输入：旧试算立即清除；在途响应由代际防护不得回填
+  tariffSeq += 1;
+  tariffResultSlot.innerHTML = "";
+  tariffError.hidden = true;
+}
+
+// 开炉时刻 / 电价 / 功率的任何修改都使旧试算失效
+tariffForm.addEventListener("input", (ev) => {
+  if (ev.target && ev.target.dataset.tariffInput) clearTariffResult();
+});
+tariffHourSel.addEventListener("change", clearTariffResult);
+tariffMinuteSel.addEventListener("change", clearTariffResult);
+
+// “统一填入”：以第一个输入的值覆盖其余；同样清除旧试算
+function fillAll(box, selector) {
+  const inputs = Array.from(box.querySelectorAll(selector));
+  if (!inputs.length) return;
+  const first = inputs[0].value;
+  inputs.slice(1).forEach((inp) => { inp.value = first; });
+  clearTariffResult();
+}
+document.getElementById("tariff-price-fill").addEventListener("click", () => {
+  fillAll(tariffPricesBox, ".js-tariff-price");
+});
+document.getElementById("tariff-power-fill").addEventListener("click", () => {
+  fillAll(tariffPowersBox, ".js-tariff-power");
+});
+
+function readNonNegList(box, selector, noun) {
+  const values = [];
+  const inputs = box.querySelectorAll(selector);
+  for (let i = 0; i < inputs.length; i++) {
+    const tok = inputs[i].value.trim();
+    if (!/^[+]?(\d+(?:\.\d+)?|\.\d+)$/.test(tok)) {
+      inputs[i].focus();
+      return { error: `${noun}第 ${i + 1} 项必须是非负数值。` };
+    }
+    values.push(Number(tok));
+  }
+  return { values };
+}
+
+function renderTariffResult(data) {
+  tariffResultSlot.innerHTML = "";
+  const box = el("div", { class: "tariff-result" });
+
+  const start = data.startMinute;
+  const last = data.steps[data.steps.length - 1];
+  const endExclusive = (start + data.stepCount * 5) % 1440;
+  const endOffset = start + data.stepCount * 5 >= 1440;
+  const crossMidnight = start + data.stepCount * 5 > 1440;
+
+  const summary = el("div", { class: "summary" });
+  summary.appendChild(kv("开炉时刻", hhmm(start, 0)));
+  summary.appendChild(kv("试算结束（不含）", hhmm(endExclusive, endOffset)));
+  summary.appendChild(kv("总 kWh", fmtKwh(data.totalKwh)));
+  summary.appendChild(kv("总电费", fmtYuan(data.totalCost)));
+  box.appendChild(summary);
+
+  if (crossMidnight) {
+    box.appendChild(el("p", {
+      class: "tariff-note",
+      textContent: "本炉试算时间跨过午夜；跨日时段电价按 00 时起每天重复计算。",
+    }));
+  }
+
+  const wrap = el("div", { class: "table-wrap" });
+  const table = el("table");
+  table.appendChild(el("thead", {},
+    el("tr", {},
+      el("th", { textContent: "档位" }),
+      el("th", { textContent: "设定温度 (°C)" }),
+      el("th", { textContent: "起止时间" }),
+      el("th", { textContent: "时长 (分钟)" }),
+      el("th", { textContent: "kWh" }),
+      el("th", { textContent: "电费（元）" }))));
+  const tbody = el("tbody");
+  data.steps.forEach((st) => {
+    const sStart = (start + (st.index - 1) * 5);
+    const sEnd = sStart + 5;
+    const crossHour = Math.floor(sStart / 60) !== Math.floor(sEnd / 60);
+    const spanText = `${hhmm(sStart % 1440, sStart >= 1440)} → ` +
+      `${hhmm(sEnd % 1440, sEnd >= 1440)}${crossHour ? " 跨小时" : ""}`;
+    const tr = el("tr", {},
+      el("td", { textContent: String(st.index) }),
+      el("td", { textContent: String(st.temperature) }),
+      el("td", { class: "tariff-time-cell", textContent: spanText }),
+      el("td", { textContent: "5" }),
+      el("td", { textContent: fmtKwh(st.kwh) }),
+      el("td", { textContent: Number(st.cost).toFixed(2) }));
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  table.appendChild(el("tfoot", {},
+    el("tr", {},
+      el("td", { attrs: { colspan: "4" }, textContent: "合计" }),
+      el("td", { textContent: fmtKwh(data.totalKwh) }),
+      el("td", { textContent: Number(data.totalCost).toFixed(2) }))));
+  wrap.appendChild(table);
+  box.appendChild(wrap);
+
+  box.appendChild(el("p", {
+    class: "hint",
+    textContent: "逐档电费各自四舍五入到两位；总电费先汇总未舍入值再四舍五入，" +
+                 "故逐档金额之和可能与总电费相差 1 分。试算结果未保存。",
+  }));
+  tariffResultSlot.appendChild(box);
+}
+
+tariffForm.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  if (tariffDraftId == null) return;
+  tariffError.hidden = true;
+
+  const startMinute =
+    Number(tariffHourSel.value) * 60 + Number(tariffMinuteSel.value);
+
+  const prices = readNonNegList(tariffPricesBox, ".js-tariff-price", "电价");
+  if (prices.error) {
+    tariffError.textContent = prices.error;
+    tariffError.hidden = false;
+    return;
+  }
+  const powers = readNonNegList(tariffPowersBox, ".js-tariff-power", "功率");
+  if (powers.error) {
+    tariffError.textContent = powers.error;
+    tariffError.hidden = false;
+    return;
+  }
+  if (prices.values.length !== 24) {
+    tariffError.textContent = "电价必须恰好为 24 个。";
+    tariffError.hidden = false;
+    return;
+  }
+  if (powers.values.length !== tariffTemperatures.length) {
+    tariffError.textContent =
+      `功率档数必须与冻结曲线等长（${tariffTemperatures.length} 档）。`;
+    tariffError.hidden = false;
+    return;
+  }
+
+  const seq = ++tariffSeq; // 新请求即作废旧结果 / 旧在途响应
+  tariffSubmitBtn.disabled = true;
+  tariffSubmitBtn.textContent = "试算中…";
+  let resp;
+  try {
+    resp = await api(`/api/drafts/${tariffDraftId}/tariff-trial`, {
+      method: "POST",
+      body: JSON.stringify({
+        startMinute,
+        prices: prices.values,
+        powers: powers.values,
+      }),
+    });
+  } catch (e) {
+    if (seq !== tariffSeq) return;
+    tariffSubmitBtn.disabled = false;
+    tariffSubmitBtn.textContent = "试算电费";
+    tariffError.textContent = "试算请求失败（网络异常），未改变任何状态，请重试。";
+    tariffError.hidden = false;
+    return;
+  }
+  if (seq !== tariffSeq) return; // 切换 / 刷新 / 编辑后的迟到响应一律作废
+  tariffSubmitBtn.disabled = false;
+  tariffSubmitBtn.textContent = "试算电费";
+  if (!resp.ok) {
+    tariffError.textContent = detailOf(resp.data);
+    tariffError.hidden = false;
+    return;
+  }
+  renderTariffResult(resp.data);
 });
 
 // ---------- 启动 ----------
